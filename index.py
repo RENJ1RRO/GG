@@ -21,26 +21,31 @@ logging.basicConfig(
 load_dotenv()
 
 # ==== КОНФИГУРАЦИЯ ====
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')  # ИСПОЛЬЗУЙТЕ .env ФАЙЛ!
 TARGET_CHANNEL_ID = 1454493797781078151  # ID вашего голосового канала
 GUILD_ID = 1454493732262117545  # ID вашего сервера
 # ======================
 
 if not DISCORD_TOKEN:
-    logging.critical("Токен не найден! Проверьте файл .env")
+    logging.critical("❌ Токен не найден! Создайте файл .env с DISCORD_TOKEN=ваш_токен")
     sys.exit(1)
 
+# Включение необходимых интентов
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # Нужно включить в настройках бота!
 intents.voice_states = True
 intents.guilds = True
+intents.members = True  # Нужно включить в настройках бота!
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(
+    command_prefix='!', 
+    intents=intents,
+    help_command=None  # Отключаем стандартную команду help
+)
 
 # Файлы для сохранения
 DATA_FILE = 'voice_time.json'
 STATE_FILE = 'bot_state.json'
-CONFIG_FILE = 'config.json'
 
 class LoveBot(commands.Cog):
     def __init__(self, bot):
@@ -48,19 +53,14 @@ class LoveBot(commands.Cog):
         self.voice_time = self.load_data()
         self.join_time = {}
         self.reconnect_attempts = 0
-        self.last_afk_check = datetime.datetime.now()
         
         # Запускаем задачи
-        self.keep_alive.start()
-        self.auto_reconnect.start()
+        self.keep_voice_alive.start()
         self.auto_save.start()
-        self.check_afk.start()
         
     def cog_unload(self):
-        self.keep_alive.cancel()
-        self.auto_reconnect.cancel()
+        self.keep_voice_alive.cancel()
         self.auto_save.cancel()
-        self.check_afk.cancel()
         self.save_all_data()
     
     def load_data(self):
@@ -69,380 +69,352 @@ class LoveBot(commands.Cog):
                 with open(DATA_FILE, 'r') as f:
                     return json.load(f)
             except:
-                pass
+                return {}
         return {}
     
     def save_data(self):
         try:
             with open(DATA_FILE, 'w') as f:
                 json.dump(self.voice_time, f, indent=4)
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"Ошибка сохранения: {e}")
     
     def save_all_data(self):
-        """Сохранить все данные перед выходом"""
+        """Сохранить все данные"""
         self.save_data()
-        
-        # Сохраняем состояние
-        state = {
-            'is_in_voice': bool(self.bot.voice_clients),
-            'last_save': datetime.datetime.now().isoformat()
-        }
-        try:
-            with open(STATE_FILE, 'w') as f:
-                json.dump(state, f, indent=4)
-        except:
-            pass
+        logging.info("💾 Все данные сохранены")
     
-    @tasks.loop(seconds=60)
-    async def keep_alive(self):
-        """Поддерживаем активность бота"""
+    @tasks.loop(seconds=30)
+    async def keep_voice_alive(self):
+        """Поддерживаем голосовое соединение"""
         try:
-            # Обновляем время для всех в голосовом канале
+            # Если бот не в голосовом канале - подключаемся
+            if not self.bot.voice_clients:
+                await self.connect_to_voice()
+            
+            # Обновляем время для активных пользователей
             current_time = datetime.datetime.now()
             for user_id, join_dt in list(self.join_time.items()):
-                if isinstance(join_dt, str):
-                    join_dt = datetime.datetime.fromisoformat(join_dt)
                 time_spent = (current_time - join_dt).total_seconds()
                 self.voice_time[user_id] = self.voice_time.get(user_id, 0) + time_spent
                 self.join_time[user_id] = current_time
-            
-            # Показываем статус каждые 30 минут
-            if datetime.datetime.now().minute % 30 == 0:
-                logging.info("Бот активен. Войс клиентов: " + str(len(self.bot.voice_clients)))
                 
         except Exception as e:
-            logging.error(f"Ошибка в keep_alive: {e}")
+            logging.error(f"Ошибка в keep_voice_alive: {e}")
     
-    @tasks.loop(seconds=10)
-    async def auto_reconnect(self):
-        """Автоматическое подключение к голосовому каналу"""
-        try:
-            # Если бот не в голосовом канале
-            if not self.bot.voice_clients:
-                guild = self.bot.get_guild(GUILD_ID)
-                if guild:
-                    channel = guild.get_channel(TARGET_CHANNEL_ID)
-                    if channel and isinstance(channel, discord.VoiceChannel):
-                        try:
-                            await channel.connect()
-                            logging.info(f"✅ Подключился к {channel.name}")
-                            self.reconnect_attempts = 0
-                            
-                            # Восстанавливаем время для пользователей в канале
-                            for member in channel.members:
-                                if not member.bot:
-                                    self.join_time[str(member.id)] = datetime.datetime.now()
-                            
-                        except discord.errors.ClientException:
-                            # Бот уже подключен где-то еще
-                            pass
-                        except Exception as e:
-                            self.reconnect_attempts += 1
-                            if self.reconnect_attempts % 10 == 0:
-                                logging.warning(f"Не могу подключиться (попытка {self.reconnect_attempts}): {e}")
-            
-            # Проверяем качество соединения
-            for vc in self.bot.voice_clients:
-                if vc.is_connected():
-                    # Периодически проверяем соединение
-                    if datetime.datetime.now().second % 30 == 0:
-                        # Отправляем тихий пакет для поддержания соединения
-                        if vc.ws:
-                            try:
-                                await vc.ws.keep_alive()
-                            except:
-                                pass
-            
-        except Exception as e:
-            logging.error(f"Ошибка в auto_reconnect: {e}")
-    
-    @tasks.loop(minutes=1)
+    @tasks.loop(minutes=5)
     async def auto_save(self):
         """Автосохранение данных"""
         try:
             self.save_data()
-            # Каждые 5 минут логируем
-            if datetime.datetime.now().minute % 5 == 0:
-                logging.info("💾 Данные сохранены")
-                total_time = sum(self.voice_time.values())
-                hours = total_time / 3600
-                logging.info(f"📊 Всего времени накоплено: {hours:.1f} часов")
+            if datetime.datetime.now().minute % 30 == 0:  # Каждые 30 минут
+                total_hours = sum(self.voice_time.values()) / 3600
+                logging.info(f"💕 Всего времени вместе: {total_hours:.1f} часов")
         except Exception as e:
             logging.error(f"Ошибка автосохранения: {e}")
     
-    @tasks.loop(minutes=5)
-    async def check_afk(self):
-        """Проверка AFK статуса и переподключение если нужно"""
+    async def connect_to_voice(self):
+        """Подключение к голосовому каналу"""
         try:
-            for vc in self.bot.voice_clients:
-                if vc.is_connected():
-                    # Если канал пустой дольше 5 минут, переподключаемся
-                    if len(vc.channel.members) <= 1:  # Только бот
-                        if (datetime.datetime.now() - self.last_afk_check).seconds > 300:
-                            logging.info("Канал пустой, проверяю соединение...")
-                            await vc.disconnect()
-                            await asyncio.sleep(2)
-                    else:
-                        self.last_afk_check = datetime.datetime.now()
+            guild = self.bot.get_guild(GUILD_ID)
+            if not guild:
+                logging.error("❌ Сервер не найден")
+                return False
+            
+            channel = guild.get_channel(TARGET_CHANNEL_ID)
+            if not channel:
+                logging.error("❌ Голосовой канал не найден")
+                return False
+            
+            # Подключаемся к каналу
+            await channel.connect()
+            logging.info(f"✅ Подключился к каналу: {channel.name}")
+            
+            # Записываем время для тех, кто уже в канале
+            for member in channel.members:
+                if not member.bot:
+                    self.join_time[str(member.id)] = datetime.datetime.now()
+            
+            self.reconnect_attempts = 0
+            return True
+            
+        except discord.errors.ClientException as e:
+            if "Already connected" in str(e):
+                return True
+            logging.error(f"❌ Ошибка подключения: {e}")
+            return False
         except Exception as e:
-            logging.error(f"Ошибка в check_afk: {e}")
+            self.reconnect_attempts += 1
+            logging.error(f"❌ Ошибка подключения (попытка {self.reconnect_attempts}): {e}")
+            return False
     
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        """Отслеживание голосовой активности"""
+        """Отслеживаем голосовую активность"""
         if member.bot:
             return
-            
+        
         user_id = str(member.id)
         
-        # Пользователь зашел в войс
+        # Пользователь зашел в наш канал
         if after.channel and after.channel.id == TARGET_CHANNEL_ID:
             self.join_time[user_id] = datetime.datetime.now()
-            logging.info(f'❤️ {member.name} присоединился к вам')
+            logging.info(f"💖 {member.name} зашел(ла) в канал")
             
-            # Приветственное сообщение (только раз в 10 минут)
-            if not hasattr(self, 'last_greeting'):
-                self.last_greeting = {}
-            
-            now = datetime.datetime.now()
-            if user_id not in self.last_greeting or (now - self.last_greeting.get(user_id, now)).seconds > 600:
-                try:
-                    # Отправляем в текстовый канал
-                    for channel in member.guild.text_channels:
-                        if channel.permissions_for(member.guild.me).send_messages:
-                            await channel.send(f"💖 Привет, {member.mention}! Рад видеть тебя снова!")
-                            self.last_greeting[user_id] = now
-                            break
-                except:
-                    pass
+            # Приветствуем в текстовом канале
+            await self.send_welcome_message(member)
         
-        # Пользователь вышел из войса
+        # Пользователь вышел из нашего канала
         elif before.channel and before.channel.id == TARGET_CHANNEL_ID:
             if user_id in self.join_time:
-                join_dt = self.join_time[user_id]
-                if isinstance(join_dt, str):
-                    join_dt = datetime.datetime.fromisoformat(join_dt)
-                
-                time_spent = (datetime.datetime.now() - join_dt).total_seconds()
+                time_spent = (datetime.datetime.now() - self.join_time[user_id]).total_seconds()
                 self.voice_time[user_id] = self.voice_time.get(user_id, 0) + time_spent
                 
-                # Сохраняем сразу
+                # Сохраняем
                 self.save_data()
                 
                 # Логируем
                 hours = time_spent / 3600
                 minutes = (time_spent % 3600) / 60
-                logging.info(f'💕 {member.name} провел(а) с вами: {int(hours)}ч {int(minutes)}м')
+                logging.info(f"💕 {member.name} провел(а): {int(hours)}ч {int(minutes)}м")
                 
                 del self.join_time[user_id]
+    
+    async def send_welcome_message(self, member):
+        """Отправляем приветственное сообщение"""
+        try:
+            # Ищем текстовый канал
+            guild = member.guild
+            for channel in guild.text_channels:
+                if channel.permissions_for(guild.me).send_messages:
+                    # Проверяем, когда последний раз приветствовали этого пользователя
+                    last_key = f"last_welcome_{member.id}"
+                    if hasattr(self, last_key):
+                        last_time = getattr(self, last_key)
+                        if (datetime.datetime.now() - last_time).seconds < 300:  # 5 минут
+                            return
+                    
+                    # Отправляем сообщение
+                    messages = [
+                        f"💖 Привет, {member.mention}! Рад тебя видеть!",
+                        f"🌟 {member.mention} присоединился(ась)! Как же я скучал(а)!",
+                        f"💕 {member.mention} вернулся(ась)! Моё сердце забилось чаще!",
+                        f"✨ {member.mention} с нами! Самый лучший момент дня!"
+                    ]
+                    
+                    await channel.send(messages[hash(member.id) % len(messages)])
+                    
+                    # Запоминаем время
+                    setattr(self, last_key, datetime.datetime.now())
+                    break
+                    
+        except Exception as e:
+            logging.error(f"Ошибка при отправке приветствия: {e}")
 
 @bot.event
 async def on_ready():
-    logging.info(f'💖 Бот {bot.user.name} готов к романтическому общению!')
-    logging.info(f'ID бота: {bot.user.id}')
-    logging.info(f'Сервер ID: {GUILD_ID}')
-    logging.info(f'Целевой канал ID: {TARGET_CHANNEL_ID}')
+    """Событие при запуске бота"""
+    logging.info(f"💖 Бот {bot.user.name} запущен!")
+    logging.info(f"🆔 ID бота: {bot.user.id}")
     
     # Устанавливаем статус
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
             name="вашу любовь 💕"
-        )
+        ),
+        status=discord.Status.online
     )
     
-    # Пытаемся сразу подключиться к каналу
-    try:
-        guild = bot.get_guild(GUILD_ID)
-        if guild:
-            channel = guild.get_channel(TARGET_CHANNEL_ID)
-            if channel:
-                await channel.connect()
-                logging.info(f"✅ Соединение установлено с каналом: {channel.name}")
-                
-                # Восстанавливаем время для тех, кто уже в канале
-                cog = bot.get_cog('LoveBot')
-                if cog:
-                    for member in channel.members:
-                        if not member.bot:
-                            cog.join_time[str(member.id)] = datetime.datetime.now()
-    except Exception as e:
-        logging.warning(f"Не удалось сразу подключиться: {e}")
+    # Пытаемся подключиться к голосовому каналу
+    cog = bot.get_cog('LoveBot')
+    if cog:
+        await asyncio.sleep(2)  # Ждем немного
+        await cog.connect_to_voice()
+    
+    logging.info("✅ Бот готов к работе!")
 
-@bot.command(name='время')
-async def time_command(ctx):
-    """Показать сколько времени вы провели вместе"""
+@bot.command(name='любовь')
+async def love_time(ctx):
+    """Показать время, проведенное вместе"""
     cog = bot.get_cog('LoveBot')
     if not cog:
-        await ctx.send("Система еще не готова, подождите немного...")
+        await ctx.send("💔 Система еще загружается, подожди немного...")
         return
     
     user_id = str(ctx.author.id)
     total_time = cog.voice_time.get(user_id, 0)
     
-    # Добавляем текущую сессию если она есть
+    # Добавляем текущую сессию
     if user_id in cog.join_time:
-        join_dt = cog.join_time[user_id]
-        if isinstance(join_dt, str):
-            join_dt = datetime.datetime.fromisoformat(join_dt)
-        current_session = (datetime.datetime.now() - join_dt).total_seconds()
+        current_session = (datetime.datetime.now() - cog.join_time[user_id]).total_seconds()
         total_time += current_session
     
-    # Рассчет времени
-    days = int(total_time // (24 * 3600))
-    hours = int((total_time % (24 * 3600)) // 3600)
+    # Рассчет
+    days = int(total_time // 86400)
+    hours = int((total_time % 86400) // 3600)
     minutes = int((total_time % 3600) // 60)
+    seconds = int(total_time % 60)
     
-    # Создаем красивый embed
+    # Красивый embed
     embed = discord.Embed(
-        title="💖 Ваше время вместе",
-        color=discord.Color.from_rgb(255, 105, 180)  # Розовый цвет
+        title="💖 Ваше Время Любви",
+        color=discord.Color.from_rgb(255, 182, 193)  # Светло-розовый
     )
     
-    if days > 0:
-        time_text = f"{days} дней {hours} часов {minutes} минут"
+    # Разные сообщения в зависимости от времени
+    if total_time < 3600:  # Меньше часа
+        message = "Это только начало прекрасной истории! 💫"
+    elif total_time < 86400:  # Меньше дня
+        message = "Каждый час с тобой - это счастье! 🌟"
     else:
-        time_text = f"{hours} часов {minutes} минут"
+        message = "Настоящая любовь с каждым днем становится только сильнее! 💕"
+    
+    time_text = []
+    if days > 0:
+        time_text.append(f"{days} дней")
+    if hours > 0:
+        time_text.append(f"{hours} часов")
+    if minutes > 0:
+        time_text.append(f"{minutes} минут")
+    if seconds > 0 and days == 0:  # Секунды только если меньше дня
+        time_text.append(f"{seconds} секунд")
     
     embed.add_field(
-        name=f"С {ctx.author.display_name}",
-        value=f"**{time_text}**\n\n"
-              f"Это примерно:\n"
-              f"• {days*24 + hours} полных часов\n"
-              f"• {int(total_time/60):,} минут\n"
-              f"• {int(total_time):,} секунд",
+        name="⏱️ Вместе проведено:",
+        value="**" + " ".join(time_text) + "**",
         inline=False
     )
     
-    # Расчет процентов
-    total_seconds_in_month = 30 * 24 * 3600  # 30 дней
-    percentage = (total_time / total_seconds_in_month) * 100
-    
+    # Дополнительная статистика
     embed.add_field(
-        name="📊 Статистика",
-        value=f"Вы провели **{percentage:.1f}%** времени этого месяца вместе!",
+        name="📊 Интересные факты:",
+        value=f"• {int(total_time/60):,} минут вместе\n"
+              f"• {int(total_time):,} секунд счастья\n"
+              f"• {int((total_time/3600)*60):,} кружек чая\n"
+              f"• {int(total_time/1800):,} песен прослушано",
         inline=False
     )
     
-    # Романтическое сообщение
-    if total_time > 3600:  # Больше часа
-        messages = [
-            "Каждая минута с тобой — это счастье! 💕",
-            "Время летит незаметно, когда мы вместе! ⏰❤️",
-            "Это только начало нашей прекрасной истории! 📖✨",
-            "С каждым часом моя любовь к тебе только крепнет! 🌹",
-            "Ты делаешь каждую секунду особенной! 🌟"
-        ]
-        embed.set_footer(text=messages[hash(user_id) % len(messages)])
-    
+    embed.set_footer(text=message)
     embed.set_thumbnail(url=ctx.author.avatar.url if ctx.author.avatar else ctx.author.default_avatar.url)
     
     await ctx.send(embed=embed)
 
 @bot.command(name='статус')
-async def status_command(ctx):
+async def bot_status(ctx):
     """Показать статус бота"""
     cog = bot.get_cog('LoveBot')
     
     embed = discord.Embed(
-        title="🤖 Статус бота любви",
-        color=discord.Color.green()
+        title="🤖 Статус Бота Любви",
+        color=discord.Color.green() if bot.voice_clients else discord.Color.red()
     )
     
-    # Информация о соединении
+    # Информация о голосовом соединении
     if bot.voice_clients:
         vc = bot.voice_clients[0]
-        status = "✅ Подключен"
-        channel_info = f"Канал: {vc.channel.name}"
-        members = len([m for m in vc.channel.members if not m.bot])
-        channel_info += f"\nЛюдей в канале: {members}"
-    else:
-        status = "🔄 Подключаюсь..."
-        channel_info = f"Канал ID: {TARGET_CHANNEL_ID}"
-    
-    embed.add_field(name="Голосовое соединение", value=f"{status}\n{channel_info}", inline=False)
-    
-    # Статистика
-    if cog:
-        total_users = len(cog.voice_time)
-        active_now = len(cog.join_time)
+        members_in_channel = [m for m in vc.channel.members if not m.bot]
         
+        voice_status = f"✅ **Подключен к:** {vc.channel.name}\n"
+        voice_status += f"👥 **Людей в канале:** {len(members_in_channel)}\n"
+        
+        if members_in_channel:
+            names = ", ".join([m.display_name for m in members_in_channel[:3]])
+            if len(members_in_channel) > 3:
+                names += f" и ещё {len(members_in_channel)-3}"
+            voice_status += f"💕 **Сейчас с вами:** {names}"
+    else:
+        voice_status = "❌ **Не подключен к голосовому каналу**\n"
+        voice_status += "⏳ *Пытаюсь подключиться...*"
+    
+    embed.add_field(name="🔊 Голосовое соединение", value=voice_status, inline=False)
+    
+    # Статистика времени
+    if cog:
         total_seconds = sum(cog.voice_time.values())
         total_hours = total_seconds / 3600
         
-        embed.add_field(name="📊 Статистика", 
-                       value=f"Отслеживается: {total_users} чел.\n"
-                             f"Сейчас активны: {active_now} чел.\n"
-                             f"Всего времени: {total_hours:.1f} часов", 
-                       inline=True)
+        stats = f"💾 **Отслеживается:** {len(cog.voice_time)} чел.\n"
+        stats += f"⏱️ **Всего времени:** {total_hours:.1f} часов\n"
+        stats += f"❤️ **Сейчас активно:** {len(cog.join_time)} чел."
+        
+        embed.add_field(name="📈 Статистика", value=stats, inline=True)
     
     # Системная информация
-    embed.add_field(name="⚙️ Система", 
-                   value=f"Пинг: {round(bot.latency * 1000)}мс\n"
-                         f"Серверов: {len(bot.guilds)}\n"
-                         f"Время работы: {str(datetime.datetime.now() - bot.start_time).split('.')[0]}", 
-                   inline=True)
+    sys_info = f"🏓 **Пинг:** {round(bot.latency * 1000)}мс\n"
+    sys_info += f"🕐 **Время работы:** {str(datetime.datetime.now() - bot.start_time).split('.')[0]}"
     
-    # Романтичный факт
-    facts = [
-        "Любовь измеряется не временем, а мгновениями! 💫",
-        "Каждая секунда с любимым — это подарок судьбы! 🎁",
-        "Настоящая любовь только крепчает со временем! 💕",
-        "Время, проведенное с тобой, бесценно! ⏳❤️"
+    embed.add_field(name="⚙️ Система", value=sys_info, inline=True)
+    
+    # Романтичная цитата
+    quotes = [
+        "Любовь не измеряется часами, а чувствами! 💞",
+        "Каждая секунда с любимым бесценна! ⏳✨",
+        "Настоящая любовь только начинается! 💘",
+        "Время, проведенное с тобой, летит незаметно! 🕊️"
     ]
-    embed.set_footer(text=facts[hash(str(ctx.author.id)) % len(facts)])
+    
+    embed.set_footer(text=quotes[hash(str(ctx.author.id)) % len(quotes)])
     
     await ctx.send(embed=embed)
 
-@bot.command(name='сброс')
-@commands.has_permissions(administrator=True)
-async def reset_command(ctx):
-    """Сбросить статистику (только для администратора)"""
-    cog = bot.get_cog('LoveBot')
-    if cog:
-        cog.voice_time = {}
-        cog.save_data()
-        await ctx.send("✅ Статистика сброшена! Начинаем новую историю любви! 💖")
-    else:
-        await ctx.send("❌ Не удалось сбросить статистику")
+@bot.command(name='помощь')
+async def help_command(ctx):
+    """Показать список команд"""
+    embed = discord.Embed(
+        title="💖 Помощь по командам бота",
+        description="Бот для отслеживания времени, проведенного вместе в голосовом канале",
+        color=discord.Color.blue()
+    )
+    
+    commands_list = [
+        ("!любовь", "Показать сколько времени вы провели вместе"),
+        ("!статус", "Показать текущий статус бота и соединения"),
+        ("!помощь", "Показать это сообщение")
+    ]
+    
+    for cmd, desc in commands_list:
+        embed.add_field(name=cmd, value=desc, inline=False)
+    
+    embed.add_field(
+        name="💕 Особенности",
+        value="• Бот автоматически подключается к вашему голосовому каналу\n"
+              "• Работает 24/7 с авто-восстановлением\n"
+              "• Сохраняет всю историю времени\n"
+              "• Отправляет милые приветствия",
+        inline=False
+    )
+    
+    embed.set_footer(text="Любите друг друга! 💘")
+    
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_disconnect():
-    logging.warning("🔌 Бот отключился от Discord")
+    logging.warning("🔌 Бот отключился")
     cog = bot.get_cog('LoveBot')
     if cog:
         cog.save_all_data()
 
 @bot.event
 async def on_resumed():
-    logging.info("🔁 Бот восстановил соединение")
-    # Пытаемся переподключиться к голосовому каналу
-    await asyncio.sleep(2)
-    try:
-        guild = bot.get_guild(GUILD_ID)
-        if guild and not bot.voice_clients:
-            channel = guild.get_channel(TARGET_CHANNEL_ID)
-            if channel:
-                await channel.connect()
-    except:
-        pass
+    logging.info("🔁 Соединение восстановлено")
+    # Пытаемся переподключиться
+    cog = bot.get_cog('LoveBot')
+    if cog:
+        await asyncio.sleep(3)
+        await cog.connect_to_voice()
 
-# Обработка завершения
-import atexit
-import signal
+# Обработка ошибок
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send(f"💔 Неизвестная команда. Используй **!помощь** для списка команд")
+    else:
+        logging.error(f"Ошибка команды: {error}")
 
-def cleanup():
-    logging.info("💾 Сохранение данных перед выходом...")
-    if 'bot' in globals():
-        cog = bot.get_cog('LoveBot')
-        if cog:
-            cog.save_all_data()
-    logging.info("👋 Бот завершает работу")
-
-atexit.register(cleanup)
-
-# Запуск бота
+# Главная функция
 async def main():
     async with bot:
         await bot.add_cog(LoveBot(bot))
@@ -450,27 +422,13 @@ async def main():
         await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    # Обработка Ctrl+C
-    import signal as sig
-    import asyncio as aio
-    
-    def signal_handler(signum, frame):
-        print("\n💕 Получен сигнал завершения...")
-        aio.get_event_loop().create_task(shutdown())
-    
-    async def shutdown():
-        logging.info("Завершение работы...")
+    # Простой запуск без сложных обработчиков сигналов
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n💖 Бот завершает работу...")
         cog = bot.get_cog('LoveBot')
         if cog:
             cog.save_all_data()
-        await bot.close()
-    
-    sig.signal(sig.SIGINT, signal_handler)
-    sig.signal(sig.SIGTERM, signal_handler)
-    
-    try:
-        aio.run(main())
-    except KeyboardInterrupt:
-        print("\n💖 Бот завершает работу...")
-    finally:
-        cleanup()
+    except Exception as e:
+        logging.critical(f"Критическая ошибка: {e}")
